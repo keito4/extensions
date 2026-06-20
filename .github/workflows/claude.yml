@@ -1,3 +1,18 @@
+# Claude Code ワークフロー
+#
+# Issue や PR で @claude をメンションすると Claude Code が応答する。
+# Bot からのイベントは自動除外。
+# PR イベントと PR 上の issue_comment では Draft PR も除外。
+#
+# 使い方:
+#   .github/workflows/claude.yml にコピーして配置
+#   リポジトリ Secret に CLAUDE_CODE_OAUTH_TOKEN を設定
+#
+# カスタマイズ:
+#   - timeout-minutes: タイムアウト（デフォルト: 30分）
+#   - allowed_tools: Claude に許可するツール
+#   - claude_args: 追加の system prompt 等
+#
 name: Claude Code
 
 on:
@@ -6,30 +21,135 @@ on:
   pull_request_review_comment:
     types: [created]
   issues:
-    types: [opened, assigned]
+    types: [opened]
   pull_request_review:
     types: [submitted]
 
+permissions: {}
+
+concurrency:
+  # イベント種別 + トリガーのコメント/レビューIDを含めることで、
+  # 同一 PR/Issue 内でも異なるメンションが互いをキャンセルしない
+  group: >-
+    claude-${{ github.repository }}-${{
+      github.event.issue.number
+      || github.event.pull_request.number
+      || github.run_id
+    }}-${{
+      github.event.comment.id
+      || github.event.review.id
+      || github.run_id
+    }}
+  cancel-in-progress: false
+
 jobs:
   claude:
+    # Bot 全般を除外し、信頼済み Association のみ許可
+    # OWNER / MEMBER / COLLABORATOR: リポジトリ管理者・チームメンバー・招待コラボレーター
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      github.event.sender.type != 'Bot' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+        github.event.comment.author_association ||
+        github.event.review.author_association ||
+        github.event.issue.author_association
+      ) &&
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body || '', '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body || '', '@claude') &&
+          github.event.pull_request.draft == false) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body || '', '@claude') &&
+          github.event.pull_request.draft == false) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body || '', '@claude') || contains(github.event.issue.title || '', '@claude')))
+      )
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
-      contents: read
+      contents: write
+      pull-requests: write
+      issues: write
       id-token: write
+      actions: read # Required for Claude to read CI results on PRs
+      checks: read
     steps:
+      - name: Check PR draft state
+        id: pr_draft
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { data: pull } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            core.setOutput('is_draft', pull.draft ? 'true' : 'false');
+
+      - name: Skip draft PR
+        if: steps.pr_draft.outputs.is_draft == 'true'
+        run: echo "Skipping Claude Code for draft PR."
+
       - name: Checkout repository
-        uses: actions/checkout@v4
+        if: steps.pr_draft.outputs.is_draft != 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 1
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@beta
+        if: steps.pr_draft.outputs.is_draft != 'true'
+        uses: anthropics/claude-code-action@d5726de019ec4498aa667642bc3a80fca83aa102 # v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
+          # This is an optional setting that allows Claude to read CI results on PRs
+          additional_permissions: |
+            actions: read
+            checks: read
+
+          # System prompt to automatically create PRs when working on Issues
+          claude_args: |
+            --allowedTools "Bash(git:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr status:*),Bash(npm:*),Bash(pnpm:*),Bash(npx:*)"
+            --system-prompt "When working on GitHub Issues (not PRs), after completing all code changes, commit and push the changes to the Claude branch. Do not run 'gh pr create'; this workflow creates the pull request from the branch after Claude finishes."
+
+      - name: Create pull request from Claude branch
+        if: >-
+          steps.claude.outputs.branch_name != '' &&
+          (
+            github.event_name == 'issues' ||
+            (github.event_name == 'issue_comment' && !github.event.issue.pull_request)
+          )
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_PR_GITHUB_TOKEN || github.token }}
+          CLAUDE_BRANCH: ${{ steps.claude.outputs.branch_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        run: |
+          if [ -z "$CLAUDE_BRANCH" ]; then
+            echo "Claude did not create a branch. Skipping PR creation."
+            exit 0
+          fi
+
+          if ! git ls-remote --exit-code --heads origin "$CLAUDE_BRANCH" >/dev/null; then
+            echo "Claude branch $CLAUDE_BRANCH was not pushed."
+            exit 1
+          fi
+
+          EXISTING_PR=$(gh pr list --head "$CLAUDE_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #$EXISTING_PR already exists for $CLAUDE_BRANCH."
+            exit 0
+          fi
+
+          TITLE="$ISSUE_TITLE"
+          if [ -z "$TITLE" ]; then
+            TITLE="Claude changes for issue #$ISSUE_NUMBER"
+          fi
+
+          BODY=$(printf "Closes #%s\n\nCreated automatically from Claude Code branch \`%s\`." "$ISSUE_NUMBER" "$CLAUDE_BRANCH")
+
+          gh pr create \
+            --head "$CLAUDE_BRANCH" \
+            --base "$DEFAULT_BRANCH" \
+            --title "$TITLE" \
+            --body "$BODY"
